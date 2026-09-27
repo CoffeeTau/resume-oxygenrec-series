@@ -183,25 +183,37 @@ def main() -> int:
             alpha_rows,
             key=lambda row: (row["hr5_mean"], row["mrr_mean"], row["ndcg_mean"]),
         )
-        if 0.0 in alphas:
-            base_hr5 = next(
-                row for row in alpha_rows if row["alpha"] == 0.0
-            )["hr5_mean"]
-        else:
-            baseline_seed_rows = []
-            for seed_dir in seed_dirs:
-                base_dir = seed_dir / "base"
-                candidate_dir = seed_dir / candidate_name
-                baseline_seed_rows.append(evaluate_pair(
-                    load_rankings(base_dir / artifact_name),
-                    load_rankings(candidate_dir / artifact_name),
-                    SIDRegistry.from_json(base_dir / "sid_registry.json"),
-                    alpha=0.0, rrf_k=args.rrf_k,
-                ))
-            base_hr5 = statistics.fmean(hr5(row) for row in baseline_seed_rows)
+        baseline_seed_rows = []
+        for seed_dir in seed_dirs:
+            base_dir = seed_dir / "base"
+            candidate_dir = seed_dir / candidate_name
+            baseline = evaluate_pair(
+                load_rankings(base_dir / artifact_name),
+                load_rankings(candidate_dir / artifact_name),
+                SIDRegistry.from_json(base_dir / "sid_registry.json"),
+                alpha=0.0, rrf_k=args.rrf_k,
+            )
+            baseline["seed"] = int(seed_dir.name.removeprefix("seed-"))
+            baseline_seed_rows.append(baseline)
+        base_hr5_by_seed = {
+            row["seed"]: hr5(row) for row in baseline_seed_rows
+        }
+        base_hr5 = statistics.fmean(base_hr5_by_seed.values())
         best["relative_gain_vs_base"] = (
             (best["hr5_mean"] - base_hr5) / base_hr5
             if base_hr5 is not None and base_hr5 > 0 else None
+        )
+        best["paired_hr5"] = [
+            {
+                "seed": row["seed"],
+                "base": base_hr5_by_seed[row["seed"]],
+                "fusion": hr5(row),
+                "delta": hr5(row) - base_hr5_by_seed[row["seed"]],
+            }
+            for row in best["per_seed"]
+        ]
+        best["positive_seed_count"] = sum(
+            row["delta"] > 0 for row in best["paired_hr5"]
         )
         summary["candidates"][candidate_name] = {
             "best": best,
@@ -209,12 +221,17 @@ def main() -> int:
         }
         gain = best["relative_gain_vs_base"]
         gain_text = "n/a" if gain is None else f"{gain * 100:+.2f}%"
+        paired_text = ",".join(
+            f"{row['seed']}:{row['delta']:+.6f}" for row in best["paired_hr5"]
+        )
         print(
             f"FUSION candidate={candidate_name} split={args.split} "
             f"alpha={best['alpha']:.2f} hr5={best['hr5_mean']:.6f} "
             f"gain_vs_base={gain_text} mrr={best['mrr_mean']:.6f} "
             f"ndcg={best['ndcg_mean']:.6f} "
-            f"changed_top5={best['changed_top5_fraction_mean']:.3f}"
+            f"changed_top5={best['changed_top5_fraction_mean']:.3f} "
+            f"positive_seeds={best['positive_seed_count']}/{len(best['paired_hr5'])} "
+            f"seed_deltas={paired_text}"
         )
     destination = args.root / f"fusion_{args.split}_summary.json"
     destination.write_text(
