@@ -23,6 +23,7 @@ from oxygenrec.data import (
 from oxygenrec.sid import SIDRegistry
 from oxygenrec.llm_reasoning import GeneratedReasoning, ReasoningGenerationError
 from summarize_v1_fast_slow import load_results, summarize, write_outputs
+from evaluate_v1_rank_fusion import evaluate_pair, reciprocal_rank_fusion
 
 try:
     import torch
@@ -165,6 +166,37 @@ class FastSlowSummaryTest(unittest.TestCase):
             summarize(grouped, split="validation")
 
 
+class FastSlowFusionTest(unittest.TestCase):
+    def test_alpha_zero_preserves_base_and_positive_alpha_can_reorder(self):
+        base_row = [[1, 1, 1], [2, 2, 2], [3, 3, 3]]
+        candidate_row = [[3, 3, 3], [1, 1, 1], [2, 2, 2]]
+        self.assertEqual(
+            reciprocal_rank_fusion(
+                base_row, candidate_row, alpha=0.0, rrf_k=10.0,
+                output_size=3,
+            ),
+            base_row,
+        )
+        fused = reciprocal_rank_fusion(
+            base_row, candidate_row, alpha=1.0, rrf_k=10.0,
+            output_size=3,
+        )
+        self.assertEqual(fused[0], [1, 1, 1])
+        self.assertEqual(fused[1], [3, 3, 3])
+
+    def test_evaluate_pair_rejects_different_cohorts(self):
+        registry = SIDRegistry({"a": (1, 1, 1), "b": (2, 2, 2)})
+        base = {
+            "sample_keys": ["a"], "target_item_ids": ["a"],
+            "semantic_ids": [[[1, 1, 1], [2, 2, 2]]],
+            "beam_scores": [[0.0, -1.0]],
+        }
+        candidate = dict(base)
+        candidate["sample_keys"] = ["different"]
+        with self.assertRaisesRegex(ValueError, "cohort differ"):
+            evaluate_pair(base, candidate, registry, alpha=0.5, rrf_k=10.0)
+
+
 @unittest.skipIf(torch is None, "PyTorch is not installed in this environment")
 class CommonBaseWarmStartTest(unittest.TestCase):
     def test_expands_history_positions_and_checks_protocol(self):
@@ -265,6 +297,8 @@ class CommonBaseWarmStartTest(unittest.TestCase):
             self.assertEqual(result["selection"]["best_epoch"], 1)
             self.assertEqual(result["test"]["sample_count"], 2)
             self.assertTrue((output / "best.pt").is_file())
+            self.assertTrue((output / "validation_rankings.json").is_file())
+            self.assertTrue((output / "test_rankings.json").is_file())
 
 
 if __name__ == "__main__":

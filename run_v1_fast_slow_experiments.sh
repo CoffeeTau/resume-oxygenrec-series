@@ -9,13 +9,19 @@ SID_REGISTRY="${SID_REGISTRY:-data/processed/rq_comparison/w256_kmeanspp/sid_reg
 QWEN_MODEL="${QWEN_MODEL:-}"
 SOURCE_RESULT_ROOT="${SOURCE_RESULT_ROOT:-artifacts/v1_fast_slow_mainline}"
 
-# refine reuses the expensive Base/Qwen artifacts from the first screen but writes
-# every new checkpoint/result to an isolated V1.1 directory.
+# refine profiles reuse the expensive Base/Qwen artifacts from the first screen.
 REFINE_PROFILE=false
+REFINE2_PROFILE=false
 case "${RUN_MODE}" in
   refine|refine_confirm|refine_summary) REFINE_PROFILE=true ;;
+  refine2|refine2_confirm|refine2_summary)
+    REFINE_PROFILE=true
+    REFINE2_PROFILE=true
+    ;;
 esac
-if [[ "${REFINE_PROFILE}" == true ]]; then
+if [[ "${REFINE2_PROFILE}" == true ]]; then
+  RESULT_ROOT="${RESULT_ROOT:-artifacts/v1_fast_slow_v12}"
+elif [[ "${REFINE_PROFILE}" == true ]]; then
   RESULT_ROOT="${RESULT_ROOT:-artifacts/v1_fast_slow_v11}"
 else
   RESULT_ROOT="${RESULT_ROOT:-artifacts/v1_fast_slow_mainline}"
@@ -35,7 +41,19 @@ QWEN_MAX_NEW_TOKENS="${QWEN_MAX_NEW_TOKENS:-512}"
 QWEN_RETRY_MAX_NEW_TOKENS="${QWEN_RETRY_MAX_NEW_TOKENS:-1024}"
 QWEN_GENERATION_SEED="${QWEN_GENERATION_SEED:-17}"
 LEARNING_RATE="${LEARNING_RATE:-0.0002}"
-if [[ "${REFINE_PROFILE}" == true ]]; then
+if [[ "${REFINE2_PROFILE}" == true ]]; then
+  Q2I_WEIGHT="${Q2I_WEIGHT:-0.02}"
+  Q2I_DECODER_WEIGHT="${Q2I_DECODER_WEIGHT:-0.10}"
+  Q2I_CONTRASTIVE_WEIGHT="${Q2I_CONTRASTIVE_WEIGHT:-0.5}"
+  Q2I_TEMPERATURE="${Q2I_TEMPERATURE:-0.1}"
+  IGR_TOP_K="${IGR_TOP_K:-5}"
+  IGR_RECENCY_WEIGHT="${IGR_RECENCY_WEIGHT:-0.75}"
+  COHORT_MIN_LONG_HISTORY_ITEMS="${COHORT_MIN_LONG_HISTORY_ITEMS:-10}"
+  INSTRUCTION_FEATURE_RESIDUAL=true
+  INSTRUCTION_FEATURE_WEIGHT="${INSTRUCTION_FEATURE_WEIGHT:-0.1}"
+  ZERO_INIT_INSTRUCTION_ADAPTER=true
+  DISABLE_QWEN_TRIGGER_ITEM=true
+elif [[ "${REFINE_PROFILE}" == true ]]; then
   Q2I_WEIGHT="${Q2I_WEIGHT:-0.05}"
   Q2I_DECODER_WEIGHT="${Q2I_DECODER_WEIGHT:-0.25}"
   Q2I_CONTRASTIVE_WEIGHT="${Q2I_CONTRASTIVE_WEIGHT:-1.0}"
@@ -43,6 +61,10 @@ if [[ "${REFINE_PROFILE}" == true ]]; then
   IGR_TOP_K="${IGR_TOP_K:-5}"
   IGR_RECENCY_WEIGHT="${IGR_RECENCY_WEIGHT:-0.5}"
   COHORT_MIN_LONG_HISTORY_ITEMS="${COHORT_MIN_LONG_HISTORY_ITEMS:-10}"
+  INSTRUCTION_FEATURE_RESIDUAL=false
+  INSTRUCTION_FEATURE_WEIGHT="${INSTRUCTION_FEATURE_WEIGHT:-1.0}"
+  ZERO_INIT_INSTRUCTION_ADAPTER=false
+  DISABLE_QWEN_TRIGGER_ITEM=false
 else
   Q2I_WEIGHT="${Q2I_WEIGHT:-0.2}"
   Q2I_DECODER_WEIGHT="${Q2I_DECODER_WEIGHT:-0.0}"
@@ -51,6 +73,10 @@ else
   IGR_TOP_K="${IGR_TOP_K:-10}"
   IGR_RECENCY_WEIGHT="${IGR_RECENCY_WEIGHT:-0.0}"
   COHORT_MIN_LONG_HISTORY_ITEMS="${COHORT_MIN_LONG_HISTORY_ITEMS:-10}"
+  INSTRUCTION_FEATURE_RESIDUAL=false
+  INSTRUCTION_FEATURE_WEIGHT="${INSTRUCTION_FEATURE_WEIGHT:-1.0}"
+  ZERO_INIT_INSTRUCTION_ADAPTER=false
+  DISABLE_QWEN_TRIGGER_ITEM=false
 fi
 DEVICE="${DEVICE:-cuda}"
 
@@ -217,12 +243,22 @@ run_variant() {
     --q2i-decoder-weight "${Q2I_DECODER_WEIGHT}"
     --q2i-contrastive-weight "${Q2I_CONTRASTIVE_WEIGHT}"
     --q2i-temperature "${Q2I_TEMPERATURE}"
+    --instruction-feature-weight "${INSTRUCTION_FEATURE_WEIGHT}"
     --beam-width 10
     --init-checkpoint "${base_checkpoint}"
     --output-dir "${output_dir}"
   )
   if [[ "${variant}" == qwen_instruction || "${variant}" == qwen_q2i || "${variant}" == igr_qwen_q2i ]]; then
     command+=(--instruction-feature-cache "${CACHE_FILE}")
+  fi
+  if [[ "${INSTRUCTION_FEATURE_RESIDUAL}" == true ]]; then
+    command+=(--instruction-feature-residual)
+  fi
+  if [[ "${ZERO_INIT_INSTRUCTION_ADAPTER}" == true ]]; then
+    command+=(--zero-init-instruction-adapter)
+  fi
+  if [[ "${DISABLE_QWEN_TRIGGER_ITEM}" == true ]]; then
+    command+=(--disable-qwen-trigger-item)
   fi
   if [[ "${evaluate_test}" == true ]]; then
     command+=(--evaluate-test)
@@ -244,6 +280,30 @@ summarize_confirm() {
     --expected-variants base "${CONFIRM_VARIANT}"
 }
 
+summarize_fusion_screen() {
+  "${PYTHON_BIN}" scripts/evaluate_v1_rank_fusion.py \
+    --root "${RESULT_ROOT}/screen" \
+    --split validation \
+    --candidates qwen_instruction qwen_q2i igr_qwen_q2i
+}
+
+summarize_fusion_confirm() {
+  local fusion_alpha="${FUSION_ALPHA:-}"
+  if [[ -z "${fusion_alpha}" ]]; then
+    echo "ERROR refine2_confirm fusion requires FUSION_ALPHA from the screen summary" >&2
+    exit 2
+  fi
+  "${PYTHON_BIN}" scripts/evaluate_v1_rank_fusion.py \
+    --root "${RESULT_ROOT}/confirm" \
+    --split test \
+    --candidates "${CONFIRM_VARIANT}" \
+    --alpha "${fusion_alpha}"
+}
+
+if [[ "${REFINE2_PROFILE}" == true ]]; then
+  echo "V12_CONFIG q2i_weight=${Q2I_WEIGHT} q2i_decoder=${Q2I_DECODER_WEIGHT} contrastive=${Q2I_CONTRASTIVE_WEIGHT} igr_top_k=${IGR_TOP_K} igr_recency=${IGR_RECENCY_WEIGHT} slow_residual_weight=${INSTRUCTION_FEATURE_WEIGHT}"
+fi
+
 case "${RUN_MODE}" in
   prepare)
     pretrain_seed 17
@@ -264,6 +324,15 @@ case "${RUN_MODE}" in
       run_variant screen 17 "${variant}" false
     done
     summarize_screen
+    ;;
+  refine2)
+    pretrain_seed 17
+    build_cache
+    for variant in base qwen_instruction qwen_q2i igr_qwen_q2i; do
+      run_variant screen 17 "${variant}" false
+    done
+    summarize_screen
+    summarize_fusion_screen
     ;;
   confirm)
     CONFIRM_VARIANT="${CONFIRM_VARIANT:-}"
@@ -295,6 +364,22 @@ case "${RUN_MODE}" in
     done
     summarize_confirm
     ;;
+  refine2_confirm)
+    CONFIRM_VARIANT="${CONFIRM_VARIANT:-}"
+    if [[ "${CONFIRM_VARIANT}" != qwen_instruction && "${CONFIRM_VARIANT}" != qwen_q2i && "${CONFIRM_VARIANT}" != igr_qwen_q2i ]]; then
+      echo "ERROR refine2_confirm requires a Qwen candidate variant" >&2
+      exit 2
+    fi
+    pretrain_seed 17
+    build_cache
+    for seed in 17 23 42; do
+      pretrain_seed "${seed}"
+      run_variant confirm "${seed}" base true
+      run_variant confirm "${seed}" "${CONFIRM_VARIANT}" true
+    done
+    summarize_confirm
+    summarize_fusion_confirm
+    ;;
   summary)
     if [[ -d "${RESULT_ROOT}/screen" ]]; then
       summarize_screen
@@ -321,8 +406,23 @@ case "${RUN_MODE}" in
       summarize_confirm
     fi
     ;;
+  refine2_summary)
+    if [[ -d "${RESULT_ROOT}/screen" ]]; then
+      summarize_screen
+      summarize_fusion_screen
+    fi
+    if [[ -d "${RESULT_ROOT}/confirm" ]]; then
+      CONFIRM_VARIANT="${CONFIRM_VARIANT:-}"
+      if [[ -z "${CONFIRM_VARIANT}" ]]; then
+        echo "ERROR refine2_summary for confirm requires CONFIRM_VARIANT" >&2
+        exit 2
+      fi
+      summarize_confirm
+      summarize_fusion_confirm
+    fi
+    ;;
   *)
-    echo "ERROR RUN_MODE must be prepare, screen, confirm, summary, refine, refine_confirm, or refine_summary" >&2
+    echo "ERROR unsupported RUN_MODE=${RUN_MODE}" >&2
     exit 2
     ;;
 esac

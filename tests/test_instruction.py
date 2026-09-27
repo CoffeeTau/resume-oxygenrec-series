@@ -117,6 +117,25 @@ class InstructionQ2IIGRTest(unittest.TestCase):
         second = self.model(self.short, self.short_mask, instruction_features=ones).logits
         self.assertFalse(torch.allclose(first[0], second[0]))
 
+    def test_zero_initialized_slow_residual_starts_from_base_prompt(self):
+        from oxygenrec.model import OxygenRECConfig, OxygenRECModel
+
+        model = OxygenRECModel(OxygenRECConfig(
+            sid_width=16, hidden_size=16, attention_heads=4,
+            encoder_layers=1, decoder_layers=1, feedforward_size=32,
+            dropout=0.0, max_history_items=3,
+            instruction_feature_size=6, instruction_feature_residual=True,
+            instruction_feature_weight=0.1,
+        )).eval()
+        torch.nn.init.zeros_(model.instruction_feature_adapter.weight)
+        torch.nn.init.zeros_(model.instruction_feature_adapter.bias)
+        baseline = model(self.short, self.short_mask).logits
+        residual = model(
+            self.short, self.short_mask, instruction_features=self.features,
+        ).logits
+        for left, right in zip(baseline, residual, strict=True):
+            torch.testing.assert_close(left, right)
+
     def test_history_context_ignores_padding_codes(self):
         self.model.eval()
         padding = self.short_mask.clone()

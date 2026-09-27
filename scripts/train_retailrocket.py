@@ -93,6 +93,19 @@ def parse_args() -> argparse.Namespace:
             "cache_qwen_instructions_retailrocket.py; required by qwen variants."
         ),
     )
+    parser.add_argument(
+        "--instruction-feature-residual", action="store_true",
+        help="Add normalized Slow features as a residual over the Base prompt.",
+    )
+    parser.add_argument("--instruction-feature-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--zero-init-instruction-adapter", action="store_true",
+        help="Start the Slow residual at the exact Base prompt.",
+    )
+    parser.add_argument(
+        "--disable-qwen-trigger-item", action="store_true",
+        help="Do not add the last history item to the Qwen scenario prompt.",
+    )
     parser.add_argument("--q2i-weight", type=float, default=0.2)
     parser.add_argument(
         "--q2i-decoder-weight", type=float, default=0.0,
@@ -166,7 +179,11 @@ def tensor_batch(samples, registry, args, device, instruction_cache=None):
         }
         # RetailRocket 没有原论文的文本 instruction。这里用严格早于 target 的
         # 最近商品作为 trigger 代理，使 query 随用户上下文变化，而非每种行为一个常量。
-        result["trigger_sids"] = result["history_sids"][:, -1, :]
+        if (
+            args.variant not in QWEN_VARIANTS
+            or not getattr(args, "disable_qwen_trigger_item", False)
+        ):
+            result["trigger_sids"] = result["history_sids"][:, -1, :]
         if args.variant == "igr_generic_q2i":
             result["scenario_ids"] = torch.zeros_like(result["scenario_ids"])
         if args.variant == "igr_text_q2i":
@@ -257,7 +274,8 @@ def tensor_batch(samples, registry, args, device, instruction_cache=None):
         result["scenario_ids"] = torch.zeros(
             len(samples), dtype=torch.long, device=device,
         )
-        result["trigger_sids"] = result["history_sids"][:, -1, :]
+        if not getattr(args, "disable_qwen_trigger_item", False):
+            result["trigger_sids"] = result["history_sids"][:, -1, :]
     return result
 
 
@@ -357,6 +375,7 @@ def validate(model, samples, registry, trie, args, device, instruction_cache=Non
     """执行 beam 排序指标以及 IGR/Q2I 诊断，不构建梯度。"""
     model.eval()
     predictions = []
+    prediction_scores = []
     targets = []
     repeat_eligible = 0
     repeat_retrieved = 0
@@ -473,6 +492,7 @@ def validate(model, samples, registry, trie, args, device, instruction_cache=Non
             beam_width=args.beam_width, **batch,
         )
         predictions.extend(output.semantic_ids.cpu().tolist())
+        prediction_scores.extend(output.scores.cpu().tolist())
         targets.extend(sample.target.item_id for sample in sample_batch)
     available = min(len(ranking) for ranking in predictions)
     ks = tuple(k for k in (1, 5, 10) if k <= available)
@@ -543,7 +563,13 @@ def validate(model, samples, registry, trie, args, device, instruction_cache=Non
         "q2i_cosine_count": len(q2i_cosines),
         "behavior_metrics": behavior_metrics,
     }
-    return metrics, retrieval
+    ranking_artifact = {
+        "sample_keys": [instruction_sample_key(sample) for sample in samples],
+        "target_item_ids": targets,
+        "semantic_ids": predictions,
+        "beam_scores": prediction_scores,
+    }
+    return metrics, retrieval, ranking_artifact
 
 
 def main() -> int:
@@ -564,6 +590,8 @@ def main() -> int:
         raise ValueError("Q2I decoder/contrastive weights cannot be negative")
     if args.q2i_temperature <= 0:
         raise ValueError("q2i-temperature must be positive")
+    if args.instruction_feature_weight < 0:
+        raise ValueError("instruction-feature-weight cannot be negative")
     if args.init_checkpoint is not None and args.retriever_init_checkpoint is not None:
         raise ValueError("init-checkpoint and retriever-init-checkpoint are mutually exclusive")
     if args.eval_only_checkpoint is not None and args.init_checkpoint is not None:
@@ -696,6 +724,10 @@ def main() -> int:
         max_history_items=args.max_history,
         scenario_vocab_size=3 if args.variant in {"instruction", "q2i", "igr", "igr_q2i"} else 1,
         instruction_feature_size=instruction_feature_size,
+        instruction_feature_residual=(
+            args.instruction_feature_residual if args.variant in QWEN_VARIANTS else False
+        ),
+        instruction_feature_weight=args.instruction_feature_weight,
         behavior_vocab_size=(
             3
             if args.variant in {"behavior", "behavior_strength_decay"}
@@ -725,7 +757,12 @@ def main() -> int:
         # Qwen adapter，保证B/C/D在同一model seed下从完全相同的adapter开始。
         with torch.random.fork_rng(devices=[]):
             torch.manual_seed(args.seed + 100_003)
-            model.instruction_feature_adapter.reset_parameters()
+            if args.zero_init_instruction_adapter:
+                torch.nn.init.zeros_(model.instruction_feature_adapter.weight)
+                if model.instruction_feature_adapter.bias is not None:
+                    torch.nn.init.zeros_(model.instruction_feature_adapter.bias)
+            else:
+                model.instruction_feature_adapter.reset_parameters()
         if model.query_to_decoder is not None:
             with torch.random.fork_rng(devices=[]):
                 torch.manual_seed(args.seed + 100_004)
@@ -766,6 +803,9 @@ def main() -> int:
             f"missing_tensors={len(incompatible.missing_keys)}"
         )
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
+    # Variant-specific modules consume different amounts of RNG during construction.
+    # Reset before dropout/training so A/B/C/D differ only by the intended modules.
+    torch.manual_seed(args.seed + 200_003)
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
     trainable_parameter_count = sum(
         parameter.numel() for parameter in model.parameters()
@@ -783,7 +823,7 @@ def main() -> int:
             args.eval_only_checkpoint, map_location=device, weights_only=False
         )
         model.load_state_dict(checkpoint["model_state"])
-        metrics, retrieval = validate(
+        metrics, retrieval, _ = validate(
             model, validation_samples, registry, trie, args, device,
             instruction_cache=instruction_cache,
         )
@@ -857,7 +897,7 @@ def main() -> int:
             batches += 1
         train_seconds = time.perf_counter() - epoch_started
         validation_started = time.perf_counter()
-        metrics, retrieval = validate(
+        metrics, retrieval, validation_rankings = validate(
             model, validation_samples, registry, trie, args, device,
             instruction_cache=instruction_cache,
         )
@@ -964,6 +1004,10 @@ def main() -> int:
                 "q2i_decoder_weight_argument": args.q2i_decoder_weight,
                 "q2i_contrastive_weight_argument": args.q2i_contrastive_weight,
                 "q2i_temperature_argument": args.q2i_temperature,
+                "instruction_feature_residual_argument": args.instruction_feature_residual,
+                "instruction_feature_weight_argument": args.instruction_feature_weight,
+                "zero_init_instruction_adapter_argument": args.zero_init_instruction_adapter,
+                "disable_qwen_trigger_item_argument": args.disable_qwen_trigger_item,
             },
         })
         current_record = epoch_records[-1]
@@ -973,6 +1017,10 @@ def main() -> int:
             best_score = score
             best_record = current_record
             torch.save(checkpoint, args.output_dir / "best.pt")
+            (args.output_dir / "validation_rankings.json").write_text(
+                json.dumps(validation_rankings, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
         (args.output_dir / "metrics.jsonl").write_text(
             "".join(json.dumps(record, sort_keys=True) + "\n" for record in epoch_records),
             encoding="utf-8",
@@ -991,7 +1039,7 @@ def main() -> int:
         )
         model.load_state_dict(best_checkpoint["model_state"])
         test_started = time.perf_counter()
-        test_metrics, test_retrieval = validate(
+        test_metrics, test_retrieval, test_rankings = validate(
             model, test_samples, registry, trie, args, device,
             instruction_cache=instruction_cache,
         )
@@ -1004,6 +1052,10 @@ def main() -> int:
             "retrieval": test_retrieval,
             "evaluation_seconds": time.perf_counter() - test_started,
         }
+        (args.output_dir / "test_rankings.json").write_text(
+            json.dumps(test_rankings, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
     (args.output_dir / "result.json").write_text(
         json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8",
     )

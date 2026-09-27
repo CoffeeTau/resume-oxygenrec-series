@@ -33,6 +33,10 @@ class OxygenRECConfig:
     instruction_vocab_size: int = 1
     scenario_vocab_size: int = 1
     instruction_feature_size: int = 0
+    # V1.2 keeps the Base reasoning prompt and learns a small normalized Slow
+    # feature residual, avoiding replacement by a randomly initialized adapter.
+    instruction_feature_residual: bool = False
+    instruction_feature_weight: float = 1.0
     behavior_vocab_size: int = 0
     # v2 的目标行为指令词表；0 表示保持 v1 路径，不创建 Decoder 侧 I_b。
     behavior_instruction_vocab_size: int = 0
@@ -100,6 +104,8 @@ class OxygenRECConfig:
             )
         if self.behavior_time_decay < 0:
             raise ValueError("behavior_time_decay cannot be negative")
+        if self.instruction_feature_weight < 0:
+            raise ValueError("instruction_feature_weight cannot be negative")
         for name in (
             "q2i_weight", "q2i_decoder_weight", "q2i_contrastive_weight",
             "q2i_variance_weight", "q2i_decorrelation_weight",
@@ -542,14 +548,27 @@ class OxygenRECModel(nn.Module):
             if trigger_sids.shape != (batch_size, self.config.sid_levels):
                 raise ValueError("trigger_sids must have shape [batch, levels]")
             scenario = scenario + self._item_embedding(trigger_sids)
+        base_reasoning = self.instruction_embeddings(instruction_ids)
         if instruction_features is None:
-            reasoning = self.instruction_embeddings(instruction_ids)
+            reasoning = base_reasoning
         else:
             if self.instruction_feature_adapter is None:
                 raise ValueError("instruction_feature_size must be configured")
             if instruction_features.shape != (batch_size, self.config.instruction_feature_size):
                 raise ValueError("instruction_features has the wrong shape")
-            reasoning = self.instruction_feature_adapter(instruction_features)
+            if self.config.instruction_feature_residual:
+                normalized_features = F.layer_norm(
+                    instruction_features, (self.config.instruction_feature_size,)
+                )
+                feature_reasoning = self.instruction_feature_adapter(
+                    normalized_features
+                )
+                reasoning = (
+                    base_reasoning
+                    + self.config.instruction_feature_weight * feature_reasoning
+                )
+            else:
+                reasoning = self.instruction_feature_adapter(instruction_features)
         if history_context is not None:
             reasoning = reasoning + history_context
         # query=[B,Q] 会同时用于长历史 IGR 相似度和目标商品 Q2I 对齐。

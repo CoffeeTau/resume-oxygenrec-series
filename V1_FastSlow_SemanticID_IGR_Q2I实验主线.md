@@ -298,6 +298,52 @@ RUN_MODE=refine_confirm CONFIRM_VARIANT=qwen_q2i \
 若 D 胜出，则把候选改成 `igr_qwen_q2i`。此外，D 的
 `delta_recent` 应大于 0；否则即使 HR@5 偶然提高，也不能声称 IGR 检索机制优于简单时序基线。
 
+## 6.4 V1.1 仍无增益时：V1.2 残差注入与保守融合
+
+V1.1 的实际 screen 结果为：Base HR@5=`0.358`，Q2I 与 IGR 均为 `0.354`；
+IGR 的 exact recall 从首轮约 `0.568` 提高到 `0.585`，但仍低于 recent=`0.610`。
+这说明时间融合缩小了检索差距，却还没有形成推荐增益。
+
+继续检查代码后发现，Qwen 变体原先用随机初始化的
+`instruction_feature_adapter(Qwen feature)` **完全替换** Base 已训练好的 reasoning prompt。
+这会让 Slow 分支在微调开始时发生不必要的分布偏移。V1.2 改为：
+
+```text
+reasoning = Base reasoning prompt
+          + 0.1 × Linear(LayerNorm(Qwen feature))
+```
+
+其中 Linear 零初始化，因此训练第 0 步严格退化为 Base；只有 Slow 特征学到有效梯度后才逐步影响 Decoder。
+V1.2 同时移除 Qwen 分支额外添加的 last-item trigger（该信息已存在于 Encoder 历史中），并在模型构造后
+重置训练 RNG，避免不同变体因新增模块消耗不同随机数而得到不同的 dropout 序列。
+Q2I 同时改为更保守的权重：总权重 `0.02`、Decoder 残差 `0.10`、对比项 `0.5`；
+IGR recency 权重提高到 `0.75`，继续减少不可靠语义检索带来的替换。
+
+运行命令：
+
+```bash
+RUN_MODE=refine2 ./run_v1_fast_slow_experiments.sh
+```
+
+仍复用首轮 Base 与 Qwen cache，新结果写入：
+
+```text
+artifacts/v1_fast_slow_v12/
+```
+
+V1.2 还会为每个最佳 epoch 保存 `validation_rankings.json`，随后自动执行 Base/Slow
+Reciprocal Rank Fusion。终端会额外输出：
+
+```text
+FUSION candidate=qwen_instruction ...
+FUSION candidate=qwen_q2i ...
+FUSION candidate=igr_qwen_q2i ...
+```
+
+融合网格包含 `alpha=0`，即纯 Base，因此验证集选择结果不会为了“必须融合”而接受一个低于 Base
+的方案。需要同时截图普通 `variant=...` 与 `FUSION ...` 两部分；前者判断单模型增益，后者判断
+Fast 主模型与 Slow 分支是否存在互补预测。
+
 # 7. 结果在哪里
 
 默认根目录：
