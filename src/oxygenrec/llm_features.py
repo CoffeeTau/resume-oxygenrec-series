@@ -21,6 +21,8 @@ class LLMFeatureBatch:
 def build_behavior_prompt(
     *, history_length: int, behavior_counts: dict[str, int],
     recent_behaviors: Sequence[str], repeated_item_kinds: int,
+    recent_item_anchors: Sequence[str] = (),
+    repeated_item_anchors: Sequence[str] = (),
 ) -> str:
     """只用严格早于 target 的行为证据构造结构化、无标签泄漏的 prompt。"""
 
@@ -29,6 +31,11 @@ def build_behavior_prompt(
     counts = {name: int(behavior_counts.get(name, 0)) for name in (
         "view", "addtocart", "transaction"
     )}
+    item_context = ""
+    if recent_item_anchors:
+        item_context += f"\n近期商品锚点: {', '.join(recent_item_anchors)}"
+    if repeated_item_anchors:
+        item_context += f"\n重复商品锚点: {', '.join(repeated_item_anchors)}"
     return (
         "你是电商检索规划器。只能依据目标事件之前的用户行为证据，"
         "生成用于长期历史检索的简短意图表示；不得猜测下一次真实行为或商品。\n"
@@ -36,7 +43,8 @@ def build_behavior_prompt(
         f"行为计数: view={counts['view']}, addtocart={counts['addtocart']}, "
         f"transaction={counts['transaction']}\n"
         f"最近行为: {', '.join(recent_behaviors)}\n"
-        f"重复访问商品种类: {repeated_item_kinds}\n"
+        f"重复访问商品种类: {repeated_item_kinds}"
+        f"{item_context}\n"
         "检索目标: 总结长期兴趣、高意图线索、时效性和候选多样性。"
     )
 

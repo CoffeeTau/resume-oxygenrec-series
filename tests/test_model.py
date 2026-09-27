@@ -46,6 +46,18 @@ class OxygenRECModelTest(unittest.TestCase):
         output.loss.backward()
         self.assertTrue(any(parameter.grad is not None for parameter in self.model.parameters()))
 
+    def test_q2i_diagnostics_do_not_change_loss_when_weight_is_zero(self):
+        baseline = self.model(
+            self.history, self.padding, target_sids=self.targets,
+        )
+        diagnostic = self.model(
+            self.history, self.padding, target_sids=self.targets,
+            compute_q2i_diagnostics=True,
+        )
+        torch.testing.assert_close(diagnostic.loss, baseline.loss)
+        self.assertEqual(tuple(diagnostic.q2i_cosine.shape), (2,))
+        self.assertIsNotNone(diagnostic.q2i_alignment_loss)
+
     def test_padding_codes_do_not_change_logits(self):
         self.model.eval()
         changed = self.history.clone()

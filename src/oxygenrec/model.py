@@ -248,6 +248,7 @@ class OxygenRECModel(nn.Module):
         retrieval_mode: RetrievalMode = PAPER_IGR,
         level_weights: Sequence[float] | Tensor | None = None,
         output_items: int = 1,
+        compute_q2i_diagnostics: bool = False,
     ) -> OxygenRECOutput:
         """执行主前向：构造 query、可选 IGR、Encoder、Decoder 和联合损失。
 
@@ -342,13 +343,14 @@ class OxygenRECModel(nn.Module):
         loss = ntp_loss
         q2i_loss = alignment_loss = q2i_cosine = None
         # 5) Q2I 让 query 靠近目标商品向量；总损失=NTP+权重*Q2I。
-        if self.config.q2i_weight > 0:
+        if self.config.q2i_weight > 0 or compute_q2i_diagnostics:
             if target_sids.ndim != 2:
                 raise ValueError("Q2I listwise target alignment is not implemented")
             targets = F.normalize(self.item_adapter(self._item_embedding(target_sids)), dim=-1)
             q2i_cosine = (query * targets).sum(dim=-1)
             q2i_loss, alignment_loss = self.q2i_alignment_loss(query, targets)
-            loss = ntp_loss + self.config.q2i_weight * q2i_loss
+            if self.config.q2i_weight > 0:
+                loss = ntp_loss + self.config.q2i_weight * q2i_loss
         return OxygenRECOutput(
             logits=logits, loss=loss, level_losses=level_losses, ntp_loss=ntp_loss,
             q2i_loss=q2i_loss, q2i_alignment_loss=alignment_loss,

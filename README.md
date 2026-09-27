@@ -18,9 +18,11 @@ their GPU control flow.
 
 ## Current milestone
 
-中文代码审阅建议先看 [代码阅读与数据流指南](代码阅读与数据流指南.md)。该指南按
-真实调用链说明数据切分、SID、Encoder-Decoder、Contextual Reasoning、Q2I、IGR
-以及当前尚未完成的边界。
+完整项目复盘建议先看 [OxygenREC项目复盘与面试指南](OxygenREC项目复盘与面试指南.md)，
+它按数据、模型、算法、测评、调优串起 v1/v2、GPU/NPU 和实验边界。只想阅读 v1
+源码调用链时，再看 [代码阅读与数据流指南](代码阅读与数据流指南.md)。
+当前用于简历质量增益验证的收敛主线、服务器命令与结果路径见
+[V1 Fast-Slow / Semantic ID / IGR-Q2I 实验主线](V1_FastSlow_SemanticID_IGR_Q2I实验主线.md)。
 
 Phase 1 starts with the smallest auditable loop:
 

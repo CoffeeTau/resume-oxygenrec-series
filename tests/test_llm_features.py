@@ -19,10 +19,14 @@ class LLMFeaturePromptTest(unittest.TestCase):
             behavior_counts={"view": 10, "addtocart": 2},
             recent_behaviors=("view", "addtocart"),
             repeated_item_kinds=3,
+            recent_item_anchors=("view:sid-1-2-3", "addtocart:sid-4-5-6"),
+            repeated_item_anchors=("sid-1-2-3:x3",),
         )
         self.assertIn("历史长度: 12", prompt)
         self.assertIn("view=10", prompt)
         self.assertIn("不得猜测下一次", prompt)
+        self.assertIn("view:sid-1-2-3", prompt)
+        self.assertIn("sid-1-2-3:x3", prompt)
         self.assertNotIn("目标SID", prompt)
 
     def test_prompt_rejects_empty_history(self):
