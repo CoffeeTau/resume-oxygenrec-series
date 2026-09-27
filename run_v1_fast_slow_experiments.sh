@@ -18,7 +18,10 @@ PRETRAIN_EPOCHS="${PRETRAIN_EPOCHS:-3}"
 FINETUNE_EPOCHS="${FINETUNE_EPOCHS:-8}"
 BATCH_SIZE="${BATCH_SIZE:-128}"
 QWEN_BATCH_SIZE="${QWEN_BATCH_SIZE:-8}"
-QWEN_MAX_NEW_TOKENS="${QWEN_MAX_NEW_TOKENS:-384}"
+QWEN_MAX_INPUT_LENGTH="${QWEN_MAX_INPUT_LENGTH:-1024}"
+QWEN_MAX_NEW_TOKENS="${QWEN_MAX_NEW_TOKENS:-512}"
+QWEN_RETRY_MAX_NEW_TOKENS="${QWEN_RETRY_MAX_NEW_TOKENS:-1024}"
+QWEN_GENERATION_SEED="${QWEN_GENERATION_SEED:-17}"
 LEARNING_RATE="${LEARNING_RATE:-0.0002}"
 Q2I_WEIGHT="${Q2I_WEIGHT:-0.2}"
 DEVICE="${DEVICE:-cuda}"
@@ -133,7 +136,12 @@ build_cache() {
       --igr-top-k 10 \
       --sample-seed "${SAMPLE_SEED}" \
       --batch-size "${QWEN_BATCH_SIZE}" \
+      --max-input-length "${QWEN_MAX_INPUT_LENGTH}" \
       --max-new-tokens "${QWEN_MAX_NEW_TOKENS}" \
+      --retry-max-new-tokens "${QWEN_RETRY_MAX_NEW_TOKENS}" \
+      --max-generation-retries 2 \
+      --generation-seed "${QWEN_GENERATION_SEED}" \
+      --progress-every-batches 10 \
       --device "${DEVICE}" \
       --dtype bfloat16
 }

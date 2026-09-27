@@ -11,11 +11,17 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from cache_qwen_instructions_retailrocket import evidence_from_history
+from cache_qwen_instructions_retailrocket import (
+    evidence_from_history,
+    generate_reasoning_with_retries,
+    load_generation_progress,
+    save_generation_progress,
+)
 from oxygenrec.data import (
     Behavior, InteractionEvent, NextItemSample, Split, TemporalBoundaries,
 )
 from oxygenrec.sid import SIDRegistry
+from oxygenrec.llm_reasoning import GeneratedReasoning, ReasoningGenerationError
 from summarize_v1_fast_slow import load_results, summarize, write_outputs
 
 try:
@@ -41,6 +47,53 @@ class QwenHistoryEvidenceTest(unittest.TestCase):
         self.assertIn("sid-1-2-3", serialized)
         self.assertNotIn("sid-7-8-9", serialized)
         self.assertNotIn("target", serialized)
+
+    @unittest.skipIf(torch is None, "PyTorch is not installed in this environment")
+    def test_failed_batch_splits_and_recovers_single_cases(self):
+        class FakeLLM:
+            def generate(self, prompts, *, max_new_tokens, generation_seed):
+                if len(prompts) > 1:
+                    raise ReasoningGenerationError(
+                        case_index=0, raw_text="{broken", hit_token_limit=True,
+                        max_new_tokens=max_new_tokens, cause=ValueError("bad"),
+                    )
+                return [GeneratedReasoning(raw_text="{}", parsed={"prompt": prompts[0]})]
+
+        stats = {
+            "generation_failures": 0, "split_retries": 0,
+            "single_case_retries": 0, "recovered_cases": 0,
+        }
+        rows = generate_reasoning_with_retries(
+            FakeLLM(), ["a", "b"], max_new_tokens=8,
+            retry_max_new_tokens=16, max_retries=2,
+            generation_seed=17, stats=stats,
+        )
+        self.assertEqual([row.parsed["prompt"] for row in rows], ["a", "b"])
+        self.assertEqual(stats["split_retries"], 1)
+
+    @unittest.skipIf(torch is None, "PyTorch is not installed in this environment")
+    def test_progress_round_trip_checks_sample_prefix(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "progress.pt"
+            signature = {"sample_seed": 17}
+            save_generation_progress(
+                path, signature=signature, sample_keys=["train:1"],
+                features=torch.ones(1, 3),
+                reasoning_records=[{"instruction_text": "x"}],
+                next_index=1,
+                retry_stats={"generation_failures": 0},
+            )
+            loaded = load_generation_progress(
+                path, signature=signature,
+                expected_sample_keys=["train:1", "train:2"],
+            )
+            self.assertEqual(loaded[0], 1)
+            torch.testing.assert_close(loaded[2], torch.ones(1, 3))
+            with self.assertRaisesRegex(ValueError, "signature mismatch"):
+                load_generation_progress(
+                    path, signature={"sample_seed": 23},
+                    expected_sample_keys=["train:1", "train:2"],
+                )
 
 
 class FastSlowSummaryTest(unittest.TestCase):

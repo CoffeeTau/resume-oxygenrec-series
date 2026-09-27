@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 import json
 from pathlib import Path
@@ -20,6 +21,26 @@ class GeneratedReasoning:
     """同时保留模型原始文本和通过严格 schema 校验后的字典。"""
     raw_text: str
     parsed: dict[str, object]
+
+
+class ReasoningGenerationError(ValueError):
+    """携带失败样本和原始输出，供上层做可审计的逐条重试。"""
+
+    def __init__(
+        self, *, case_index: int, raw_text: str, hit_token_limit: bool,
+        max_new_tokens: int, cause: Exception,
+    ) -> None:
+        self.case_index = case_index
+        self.raw_text = raw_text
+        self.hit_token_limit = hit_token_limit
+        self.max_new_tokens = max_new_tokens
+        self.cause = cause
+        preview = raw_text[:240].replace("\n", "\\n")
+        super().__init__(
+            f"reasoning case {case_index} failed schema parsing; "
+            f"hit_token_limit={hit_token_limit}; max_new_tokens={max_new_tokens}; "
+            f"generated_chars={len(raw_text)}; raw_prefix={preview!r}; {cause}"
+        )
 
 
 def contextual_instruction_text(reasoning: Mapping[str, object]) -> str:
@@ -137,6 +158,8 @@ class FrozenLLMReasoningGenerator:
             path, local_files_only=True, trust_remote_code=False,
         )
         self.tokenizer.padding_side = "left"
+        # Causal chat过长时必须保留尾部user约束和assistant JSON prefill。
+        self.tokenizer.truncation_side = "left"
         self.model = AutoModelForCausalLM.from_pretrained(
             path, local_files_only=True, trust_remote_code=False,
             dtype=dtype_by_name[dtype], low_cpu_mem_usage=True,
@@ -145,18 +168,27 @@ class FrozenLLMReasoningGenerator:
 
     def generate(
         self, evidence_prompts: Sequence[str], *, max_new_tokens: int = 192,
+        generation_seed: int | None = None,
     ) -> list[GeneratedReasoning]:
-        """批量生成 Reasoning；任一 case 不合法时携带索引与截断信息报错。"""
+        """按Qwen官方采样配置生成，并用assistant prefill强制JSON起始。"""
         import torch
 
-        # 使用模型自己的 chat template，避免手写特殊 token 与官方格式不一致。
+        if not evidence_prompts:
+            raise ValueError("evidence_prompts must not be empty")
+        if max_new_tokens < 1:
+            raise ValueError("max_new_tokens must be positive")
+        # assistant prefill 让模型直接续写JSON内容，避免先输出说明或长篇复述。
+        # Instruct-2507官方仅支持non-thinking；enable_thinking=False作为兼容性显式门。
         rendered = [
             self.tokenizer.apply_chat_template(
                 [
                     {"role": "system", "content": reasoning_system_prompt()},
                     {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": "{"},
                 ],
-                tokenize=False, add_generation_prompt=True,
+                tokenize=False,
+                continue_final_message=True,
+                enable_thinking=False,
             )
             for prompt in evidence_prompts
         ]
@@ -165,13 +197,16 @@ class FrozenLLMReasoningGenerator:
             max_length=self.max_input_length, return_tensors="pt",
         )
         tokens = {name: value.to(self.device) for name, value in tokens.items()}
-        # greedy 解码用于可复现验收；采样参数必须清空，避免产生“被忽略”警告。
+        # Instruct-2507官方generation_config为sampling；greedy在当前失败样本上
+        # 发生了无JSON的长输出。固定batch seed，在保持可复现的同时使用官方参数。
         with torch.inference_mode():
-            generation_config = self.model.generation_config
-            generation_config.do_sample = False
-            generation_config.temperature = None
-            generation_config.top_p = None
-            generation_config.top_k = None
+            if generation_seed is not None:
+                torch.manual_seed(generation_seed)
+            generation_config = copy.deepcopy(self.model.generation_config)
+            generation_config.do_sample = True
+            generation_config.temperature = 0.7
+            generation_config.top_p = 0.8
+            generation_config.top_k = 20
             generated = self.model.generate(
                 **tokens, generation_config=generation_config,
                 max_new_tokens=max_new_tokens, use_cache=True,
@@ -180,14 +215,20 @@ class FrozenLLMReasoningGenerator:
         prompt_length = tokens["input_ids"].shape[1]
         results = []
         for index, row in enumerate(generated):
-            raw = self.tokenizer.decode(row[prompt_length:], skip_special_tokens=True).strip()
+            continuation = self.tokenizer.decode(
+                row[prompt_length:], skip_special_tokens=True,
+            ).strip()
+            raw = continuation if continuation.startswith("{") else "{" + continuation
             try:
                 parsed = parse_reasoning_json(raw)
             except ValueError as error:
                 hit_token_limit = row.shape[0] >= prompt_length + max_new_tokens
-                raise ValueError(
-                    f"reasoning case {index} failed schema parsing; "
-                    f"hit_token_limit={hit_token_limit}; generated_chars={len(raw)}; {error}"
+                raise ReasoningGenerationError(
+                    case_index=index,
+                    raw_text=raw,
+                    hit_token_limit=hit_token_limit,
+                    max_new_tokens=max_new_tokens,
+                    cause=error,
                 ) from error
             results.append(GeneratedReasoning(raw_text=raw, parsed=parsed))
         return results

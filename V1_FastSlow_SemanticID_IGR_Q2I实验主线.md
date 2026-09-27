@@ -222,7 +222,7 @@ RUN_MODE=screen \
 ./run_v1_fast_slow_experiments.sh
 ```
 
-脚本可断点续跑：存在 `best.pt` 和 `result.json` 的完成任务会跳过；日志与缓存保留在固定目录。
+脚本可断点续跑：存在 `best.pt` 和 `result.json` 的完成任务会跳过；Qwen 缓存每 10 个 batch 保存一次 `*.progress.pt`，中断后使用相同命令会从已校验的样本前缀继续。日志与缓存保留在固定目录。
 
 如果服务器已有同一 SID registry、同一时间边界和同一模型配置的 100K Base，screen 可直接复用：
 
