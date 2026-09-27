@@ -72,6 +72,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--long-history", type=int, default=100)
     parser.add_argument("--igr-top-k", type=int, default=10)
     parser.add_argument(
+        "--cohort-min-long-history-items", type=int, default=None,
+        help=(
+            "Fix cohort eligibility independently from IGR top-k. This permits a "
+            "smaller retrieval K while reusing the same Qwen cache/sample cohort."
+        ),
+    )
+    parser.add_argument(
+        "--igr-recency-weight", type=float, default=0.0,
+        help="Mix recency into paper IGR ranking; 0=pure semantic, 1=pure recency.",
+    )
+    parser.add_argument(
         "--variant", choices=("base", "behavior", "behavior_strength_decay", "instruction", "q2i", "qwen_instruction", "qwen_q2i", "igr", "igr_q2i", "igr_generic_q2i", "igr_text_q2i", "igr_qwen_q2i", "v2_behavior"),
         default="base",
     )
@@ -83,6 +94,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--q2i-weight", type=float, default=0.2)
+    parser.add_argument(
+        "--q2i-decoder-weight", type=float, default=0.0,
+        help="Residual weight that injects the learned Q2I query into the decoder prompt.",
+    )
+    parser.add_argument(
+        "--q2i-contrastive-weight", type=float, default=0.0,
+        help="Weight of the multi-positive in-batch contrastive Q2I objective.",
+    )
+    parser.add_argument("--q2i-temperature", type=float, default=0.1)
     parser.add_argument(
         "--matched-igr-cohort", action="store_true",
         help="Use the IGR-eligible sample universe for every ablation variant.",
@@ -529,8 +549,21 @@ def validate(model, samples, registry, trie, args, device, instruction_cache=Non
 def main() -> int:
     """串起事件读取、时间切分、SID 映射、训练、验证和 checkpoint 保存。"""
     args = parse_args()
+    cohort_min_long_history_items = (
+        args.igr_top_k
+        if args.cohort_min_long_history_items is None
+        else args.cohort_min_long_history_items
+    )
     if args.igr_top_k > args.long_history:
         raise ValueError("igr-top-k cannot exceed long-history")
+    if not 0 <= cohort_min_long_history_items <= args.long_history:
+        raise ValueError("cohort-min-long-history-items must be in [0, long-history]")
+    if not 0.0 <= args.igr_recency_weight <= 1.0:
+        raise ValueError("igr-recency-weight must be in [0, 1]")
+    if args.q2i_decoder_weight < 0 or args.q2i_contrastive_weight < 0:
+        raise ValueError("Q2I decoder/contrastive weights cannot be negative")
+    if args.q2i_temperature <= 0:
+        raise ValueError("q2i-temperature must be positive")
     if args.init_checkpoint is not None and args.retriever_init_checkpoint is not None:
         raise ValueError("init-checkpoint and retriever-init-checkpoint are mutually exclusive")
     if args.eval_only_checkpoint is not None and args.init_checkpoint is not None:
@@ -569,7 +602,10 @@ def main() -> int:
     samples = build_next_item_samples(
         filtered_events,
         boundaries,
-        min_history=args.max_history + args.igr_top_k if matched_cohort else 1,
+        min_history=(
+            args.max_history + cohort_min_long_history_items
+            if matched_cohort else 1
+        ),
         max_history=(args.max_history + args.long_history) if matched_cohort else args.max_history,
         max_samples_per_split={
             Split.TRAIN: args.max_train_samples,
@@ -592,6 +628,7 @@ def main() -> int:
         f"stage=samples variant={args.variant} matched_cohort={matched_cohort} "
         f"train={len(train_samples)} validation={len(validation_samples)} "
         f"test={len(test_samples)} model_seed={args.seed} sample_seed={args.sample_seed} "
+        f"cohort_min_long={cohort_min_long_history_items} "
         f"train_behaviors={dict(sorted(Counter(sample.target.behavior.value for sample in train_samples).items()))} "
         f"behavior_weights={V2_BEHAVIOR_WEIGHTS if args.variant in V2_BEHAVIOR_VARIANTS else None}"
     )
@@ -613,7 +650,9 @@ def main() -> int:
             "sample_seed": args.sample_seed,
             "short_history": args.max_history,
             "long_history": args.long_history,
-            "igr_top_k": args.igr_top_k,
+            # Cache metadata's igr_top_k records the minimum long-history
+            # eligibility used when that fixed cohort was sampled.
+            "igr_top_k": cohort_min_long_history_items,
         }
         mismatches = {
             name: {"expected": expected, "actual": metadata.get(name)}
@@ -667,6 +706,16 @@ def main() -> int:
         behavior_time_decay=0.05 if args.variant == "behavior_strength_decay" else 0.0,
         igr_top_k=args.igr_top_k if uses_igr else 0,
         q2i_weight=args.q2i_weight if args.variant in Q2I_VARIANTS else 0.0,
+        q2i_decoder_weight=(
+            args.q2i_decoder_weight if args.variant in Q2I_VARIANTS else 0.0
+        ),
+        q2i_contrastive_weight=(
+            args.q2i_contrastive_weight if args.variant in Q2I_VARIANTS else 0.0
+        ),
+        q2i_temperature=args.q2i_temperature,
+        igr_recency_weight=(
+            args.igr_recency_weight if uses_igr else 0.0
+        ),
         use_history_context_instruction=args.history_context_instruction,
         history_context_pooling=args.history_context_pooling,
     )
@@ -677,6 +726,10 @@ def main() -> int:
         with torch.random.fork_rng(devices=[]):
             torch.manual_seed(args.seed + 100_003)
             model.instruction_feature_adapter.reset_parameters()
+        if model.query_to_decoder is not None:
+            with torch.random.fork_rng(devices=[]):
+                torch.manual_seed(args.seed + 100_004)
+                model.query_to_decoder.reset_parameters()
     model = model.to(device)
     warm_start = None
     if args.init_checkpoint is not None:
@@ -900,12 +953,17 @@ def main() -> int:
                 "max_history": args.max_history,
                 "long_history": args.long_history,
                 "igr_top_k": args.igr_top_k,
+                "cohort_min_long_history_items": cohort_min_long_history_items,
+                "igr_recency_weight_argument": args.igr_recency_weight,
                 "matched_igr_cohort": args.matched_igr_cohort,
                 "batch_size": args.batch_size,
                 "epochs": args.epochs,
                 "learning_rate": args.learning_rate,
                 "beam_width": args.beam_width,
                 "q2i_weight_argument": args.q2i_weight,
+                "q2i_decoder_weight_argument": args.q2i_decoder_weight,
+                "q2i_contrastive_weight_argument": args.q2i_contrastive_weight,
+                "q2i_temperature_argument": args.q2i_temperature,
             },
         })
         current_record = epoch_records[-1]

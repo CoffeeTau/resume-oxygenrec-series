@@ -7,7 +7,19 @@ RUN_MODE="${RUN_MODE:-screen}"
 EVENTS="${EVENTS:-data/raw/retailrocket/events.csv}"
 SID_REGISTRY="${SID_REGISTRY:-data/processed/rq_comparison/w256_kmeanspp/sid_registry.json}"
 QWEN_MODEL="${QWEN_MODEL:-}"
-RESULT_ROOT="${RESULT_ROOT:-artifacts/v1_fast_slow_mainline}"
+SOURCE_RESULT_ROOT="${SOURCE_RESULT_ROOT:-artifacts/v1_fast_slow_mainline}"
+
+# refine reuses the expensive Base/Qwen artifacts from the first screen but writes
+# every new checkpoint/result to an isolated V1.1 directory.
+REFINE_PROFILE=false
+case "${RUN_MODE}" in
+  refine|refine_confirm|refine_summary) REFINE_PROFILE=true ;;
+esac
+if [[ "${REFINE_PROFILE}" == true ]]; then
+  RESULT_ROOT="${RESULT_ROOT:-artifacts/v1_fast_slow_v11}"
+else
+  RESULT_ROOT="${RESULT_ROOT:-artifacts/v1_fast_slow_mainline}"
+fi
 
 SAMPLE_SEED="${SAMPLE_SEED:-17}"
 PRETRAIN_SAMPLES="${PRETRAIN_SAMPLES:-100000}"
@@ -23,12 +35,34 @@ QWEN_MAX_NEW_TOKENS="${QWEN_MAX_NEW_TOKENS:-512}"
 QWEN_RETRY_MAX_NEW_TOKENS="${QWEN_RETRY_MAX_NEW_TOKENS:-1024}"
 QWEN_GENERATION_SEED="${QWEN_GENERATION_SEED:-17}"
 LEARNING_RATE="${LEARNING_RATE:-0.0002}"
-Q2I_WEIGHT="${Q2I_WEIGHT:-0.2}"
+if [[ "${REFINE_PROFILE}" == true ]]; then
+  Q2I_WEIGHT="${Q2I_WEIGHT:-0.05}"
+  Q2I_DECODER_WEIGHT="${Q2I_DECODER_WEIGHT:-0.25}"
+  Q2I_CONTRASTIVE_WEIGHT="${Q2I_CONTRASTIVE_WEIGHT:-1.0}"
+  Q2I_TEMPERATURE="${Q2I_TEMPERATURE:-0.1}"
+  IGR_TOP_K="${IGR_TOP_K:-5}"
+  IGR_RECENCY_WEIGHT="${IGR_RECENCY_WEIGHT:-0.5}"
+  COHORT_MIN_LONG_HISTORY_ITEMS="${COHORT_MIN_LONG_HISTORY_ITEMS:-10}"
+else
+  Q2I_WEIGHT="${Q2I_WEIGHT:-0.2}"
+  Q2I_DECODER_WEIGHT="${Q2I_DECODER_WEIGHT:-0.0}"
+  Q2I_CONTRASTIVE_WEIGHT="${Q2I_CONTRASTIVE_WEIGHT:-0.0}"
+  Q2I_TEMPERATURE="${Q2I_TEMPERATURE:-0.1}"
+  IGR_TOP_K="${IGR_TOP_K:-10}"
+  IGR_RECENCY_WEIGHT="${IGR_RECENCY_WEIGHT:-0.0}"
+  COHORT_MIN_LONG_HISTORY_ITEMS="${COHORT_MIN_LONG_HISTORY_ITEMS:-10}"
+fi
 DEVICE="${DEVICE:-cuda}"
 
 CACHE_DIR="${RESULT_ROOT}/cache"
-CACHE_FILE="${CACHE_DIR}/qwen_instruction_features.pt"
-REASONING_FILE="${CACHE_DIR}/qwen_instruction_reasoning.jsonl"
+if [[ "${REFINE_PROFILE}" == true ]]; then
+  BASE_CHECKPOINT_17="${BASE_CHECKPOINT_17:-${SOURCE_RESULT_ROOT}/pretrain/seed-17/base/best.pt}"
+  CACHE_FILE="${CACHE_FILE:-${SOURCE_RESULT_ROOT}/cache/qwen_instruction_features.pt}"
+  REASONING_FILE="${REASONING_FILE:-${SOURCE_RESULT_ROOT}/cache/qwen_instruction_reasoning.jsonl}"
+else
+  CACHE_FILE="${CACHE_FILE:-${CACHE_DIR}/qwen_instruction_features.pt}"
+  REASONING_FILE="${REASONING_FILE:-${CACHE_DIR}/qwen_instruction_reasoning.jsonl}"
+fi
 LOG_DIR="${RESULT_ROOT}/logs"
 
 mkdir -p "${CACHE_DIR}" "${LOG_DIR}"
@@ -92,7 +126,8 @@ pretrain_seed() {
       --matched-igr-cohort \
       --max-history 20 \
       --long-history 100 \
-      --igr-top-k 10 \
+      --igr-top-k "${IGR_TOP_K}" \
+      --cohort-min-long-history-items "${COHORT_MIN_LONG_HISTORY_ITEMS}" \
       --max-train-samples "${PRETRAIN_SAMPLES}" \
       --max-validation-samples "${VALIDATION_SAMPLES}" \
       --max-test-samples "${TEST_SAMPLES}" \
@@ -133,7 +168,7 @@ build_cache() {
       --max-test-samples "${TEST_SAMPLES}" \
       --short-history 20 \
       --long-history 100 \
-      --igr-top-k 10 \
+      --igr-top-k "${COHORT_MIN_LONG_HISTORY_ITEMS}" \
       --sample-seed "${SAMPLE_SEED}" \
       --batch-size "${QWEN_BATCH_SIZE}" \
       --max-input-length "${QWEN_MAX_INPUT_LENGTH}" \
@@ -169,7 +204,9 @@ run_variant() {
     --matched-igr-cohort
     --max-history 20
     --long-history 100
-    --igr-top-k 10
+    --igr-top-k "${IGR_TOP_K}"
+    --cohort-min-long-history-items "${COHORT_MIN_LONG_HISTORY_ITEMS}"
+    --igr-recency-weight "${IGR_RECENCY_WEIGHT}"
     --max-train-samples "${FINETUNE_SAMPLES}"
     --max-validation-samples "${VALIDATION_SAMPLES}"
     --max-test-samples "${TEST_SAMPLES}"
@@ -177,6 +214,9 @@ run_variant() {
     --epochs "${FINETUNE_EPOCHS}"
     --learning-rate "${LEARNING_RATE}"
     --q2i-weight "${Q2I_WEIGHT}"
+    --q2i-decoder-weight "${Q2I_DECODER_WEIGHT}"
+    --q2i-contrastive-weight "${Q2I_CONTRASTIVE_WEIGHT}"
+    --q2i-temperature "${Q2I_TEMPERATURE}"
     --beam-width 10
     --init-checkpoint "${base_checkpoint}"
     --output-dir "${output_dir}"
@@ -217,10 +257,33 @@ case "${RUN_MODE}" in
     done
     summarize_screen
     ;;
+  refine)
+    pretrain_seed 17
+    build_cache
+    for variant in base qwen_instruction qwen_q2i igr_qwen_q2i; do
+      run_variant screen 17 "${variant}" false
+    done
+    summarize_screen
+    ;;
   confirm)
     CONFIRM_VARIANT="${CONFIRM_VARIANT:-}"
     if [[ "${CONFIRM_VARIANT}" != qwen_instruction && "${CONFIRM_VARIANT}" != qwen_q2i && "${CONFIRM_VARIANT}" != igr_qwen_q2i ]]; then
       echo "ERROR set CONFIRM_VARIANT to qwen_instruction, qwen_q2i, or igr_qwen_q2i" >&2
+      exit 2
+    fi
+    pretrain_seed 17
+    build_cache
+    for seed in 17 23 42; do
+      pretrain_seed "${seed}"
+      run_variant confirm "${seed}" base true
+      run_variant confirm "${seed}" "${CONFIRM_VARIANT}" true
+    done
+    summarize_confirm
+    ;;
+  refine_confirm)
+    CONFIRM_VARIANT="${CONFIRM_VARIANT:-}"
+    if [[ "${CONFIRM_VARIANT}" != qwen_q2i && "${CONFIRM_VARIANT}" != igr_qwen_q2i ]]; then
+      echo "ERROR refine_confirm requires CONFIRM_VARIANT=qwen_q2i or igr_qwen_q2i" >&2
       exit 2
     fi
     pretrain_seed 17
@@ -245,8 +308,21 @@ case "${RUN_MODE}" in
       summarize_confirm
     fi
     ;;
+  refine_summary)
+    if [[ -d "${RESULT_ROOT}/screen" ]]; then
+      summarize_screen
+    fi
+    if [[ -d "${RESULT_ROOT}/confirm" ]]; then
+      CONFIRM_VARIANT="${CONFIRM_VARIANT:-}"
+      if [[ -z "${CONFIRM_VARIANT}" ]]; then
+        echo "ERROR refine_summary for confirm requires CONFIRM_VARIANT" >&2
+        exit 2
+      fi
+      summarize_confirm
+    fi
+    ;;
   *)
-    echo "ERROR RUN_MODE must be prepare, screen, confirm, or summary" >&2
+    echo "ERROR RUN_MODE must be prepare, screen, confirm, summary, refine, refine_confirm, or refine_summary" >&2
     exit 2
     ;;
 esac

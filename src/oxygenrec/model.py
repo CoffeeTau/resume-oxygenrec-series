@@ -41,9 +41,17 @@ class OxygenRECConfig:
     history_context_pooling: str = "mean"
     q2i_dimension: int = 128
     q2i_weight: float = 0.0
+    # V1.1: make the Q2I representation affect the decoder instead of living
+    # only in an auxiliary projection head.
+    q2i_decoder_weight: float = 0.0
+    q2i_contrastive_weight: float = 0.0
+    q2i_temperature: float = 0.1
     q2i_variance_weight: float = 0.01
     q2i_decorrelation_weight: float = 0.01
     igr_top_k: int = 0
+    # 0 keeps the original pure semantic IGR; positive values mix normalized
+    # semantic affinity with a deterministic recency prior.
+    igr_recency_weight: float = 0.0
     hidden_size: int = 128
     attention_heads: int = 4
     encoder_layers: int = 2
@@ -92,9 +100,16 @@ class OxygenRECConfig:
             )
         if self.behavior_time_decay < 0:
             raise ValueError("behavior_time_decay cannot be negative")
-        for name in ("q2i_weight", "q2i_variance_weight", "q2i_decorrelation_weight"):
+        for name in (
+            "q2i_weight", "q2i_decoder_weight", "q2i_contrastive_weight",
+            "q2i_variance_weight", "q2i_decorrelation_weight",
+        ):
             if getattr(self, name) < 0:
                 raise ValueError(f"{name} cannot be negative")
+        if self.q2i_temperature <= 0:
+            raise ValueError("q2i_temperature must be positive")
+        if not 0.0 <= self.igr_recency_weight <= 1.0:
+            raise ValueError("igr_recency_weight must be in [0, 1]")
         if self.history_context_pooling not in {"mean", "attention"}:
             raise ValueError("history_context_pooling must be mean or attention")
 
@@ -109,6 +124,7 @@ class OxygenRECOutput:
     ntp_loss: Tensor | None = None
     q2i_loss: Tensor | None = None
     q2i_alignment_loss: Tensor | None = None
+    q2i_contrastive_loss: Tensor | None = None
     q2i_cosine: Tensor | None = None
     igr_indices: Tensor | None = None
     igr_scores: Tensor | None = None
@@ -178,6 +194,10 @@ class OxygenRECModel(nn.Module):
         self.item_adapter = nn.Sequential(
             nn.Linear(config.hidden_size, config.hidden_size), nn.GELU(),
             nn.Linear(config.hidden_size, config.q2i_dimension),
+        )
+        self.query_to_decoder = (
+            nn.Linear(config.q2i_dimension, config.hidden_size, bias=False)
+            if config.q2i_decoder_weight > 0 else None
         )
         self.bos_embedding = nn.Parameter(torch.empty(config.hidden_size))
         self.decoder_positions = nn.Embedding(
@@ -341,19 +361,35 @@ class OxygenRECModel(nn.Module):
             token_weights=token_weights,
         )
         loss = ntp_loss
-        q2i_loss = alignment_loss = q2i_cosine = None
+        q2i_loss = alignment_loss = contrastive_loss = q2i_cosine = None
         # 5) Q2I 让 query 靠近目标商品向量；总损失=NTP+权重*Q2I。
         if self.config.q2i_weight > 0 or compute_q2i_diagnostics:
             if target_sids.ndim != 2:
                 raise ValueError("Q2I listwise target alignment is not implemented")
-            targets = F.normalize(self.item_adapter(self._item_embedding(target_sids)), dim=-1)
+            # Q2I只训练item adapter，不直接拖动主任务共享的SID embedding；否则辅助
+            # 目标很容易提高cosine却破坏NTP排序。
+            item_features = self._item_embedding(target_sids).detach()
+            targets = F.normalize(self.item_adapter(item_features), dim=-1)
             q2i_cosine = (query * targets).sum(dim=-1)
             q2i_loss, alignment_loss = self.q2i_alignment_loss(query, targets)
+            if self.config.q2i_contrastive_weight > 0:
+                same_target = (
+                    target_sids[:, None, :] == target_sids[None, :, :]
+                ).all(dim=-1)
+                contrastive_loss = self.q2i_multi_positive_contrastive_loss(
+                    query, targets, same_target,
+                    temperature=self.config.q2i_temperature,
+                )
+                q2i_loss = (
+                    q2i_loss
+                    + self.config.q2i_contrastive_weight * contrastive_loss
+                )
             if self.config.q2i_weight > 0:
                 loss = ntp_loss + self.config.q2i_weight * q2i_loss
         return OxygenRECOutput(
             logits=logits, loss=loss, level_losses=level_losses, ntp_loss=ntp_loss,
             q2i_loss=q2i_loss, q2i_alignment_loss=alignment_loss,
+            q2i_contrastive_loss=contrastive_loss,
             q2i_cosine=q2i_cosine,
             igr_indices=igr_indices, igr_scores=igr_scores,
         )
@@ -517,8 +553,18 @@ class OxygenRECModel(nn.Module):
         if history_context is not None:
             reasoning = reasoning + history_context
         # query=[B,Q] 会同时用于长历史 IGR 相似度和目标商品 Q2I 对齐。
-        query = F.normalize(self.query_adapter(torch.cat((scenario, reasoning), dim=-1)), dim=-1)
-        return scenario, reasoning, query
+        query = F.normalize(
+            self.query_adapter(torch.cat((scenario, reasoning), dim=-1)), dim=-1
+        )
+        decoder_reasoning = reasoning
+        if self.config.q2i_decoder_weight > 0:
+            if self.query_to_decoder is None:  # pragma: no cover - constructor invariant
+                raise RuntimeError("Q2I decoder adapter was not initialized")
+            decoder_reasoning = (
+                reasoning
+                + self.config.q2i_decoder_weight * self.query_to_decoder(query)
+            )
+        return scenario, decoder_reasoning, query
 
     def _behavior_instruction_prompt(
         self,
@@ -623,7 +669,21 @@ class OxygenRECModel(nn.Module):
         # 归一化 query 与 item 做点积即 cosine，padding 位置设为 -inf。
         scores = torch.einsum("bd,bhd->bh", query, long_vectors).masked_fill(long_mask, float("-inf"))
         if retrieval_mode == PAPER_IGR:
-            top_scores, top_indices = scores.topk(self.config.igr_top_k, dim=1)
+            ranking_scores = scores
+            if self.config.igr_recency_weight > 0:
+                # cosine归一到[0,1]后再与时间先验相加，避免两个分量量纲不同。
+                semantic_affinity = (scores + 1.0) / 2.0
+                recency = torch.linspace(
+                    0.0, 1.0, scores.shape[1],
+                    dtype=scores.dtype, device=scores.device,
+                ).unsqueeze(0)
+                ranking_scores = (
+                    (1.0 - self.config.igr_recency_weight) * semantic_affinity
+                    + self.config.igr_recency_weight * recency
+                ).masked_fill(long_mask, float("-inf"))
+            top_scores, top_indices = ranking_scores.topk(
+                self.config.igr_top_k, dim=1
+            )
         else:
             if long_history_behavior_ids is None:
                 raise ValueError("retrieval plans require long_history_behavior_ids")
@@ -738,6 +798,41 @@ class OxygenRECModel(nn.Module):
             + self.config.q2i_decorrelation_weight * decorrelation
         )
         return total, alignment
+
+    @staticmethod
+    def q2i_multi_positive_contrastive_loss(
+        queries: Tensor,
+        targets: Tensor,
+        positive_mask: Tensor,
+        *,
+        temperature: float,
+    ) -> Tensor:
+        """Batch内多正样本对比损失；重复target不会被错误当成负样本。"""
+        if queries.shape != targets.shape or queries.ndim != 2:
+            raise ValueError("queries and targets must share shape [batch, dimension]")
+        batch_size = queries.shape[0]
+        if positive_mask.shape != (batch_size, batch_size):
+            raise ValueError("positive_mask must have shape [batch, batch]")
+        if positive_mask.dtype != torch.bool:
+            raise ValueError("positive_mask must be boolean")
+        if temperature <= 0:
+            raise ValueError("temperature must be positive")
+        if batch_size < 2:
+            return queries.new_zeros(())
+        logits = queries @ targets.transpose(0, 1) / temperature
+        negative_infinity = torch.finfo(logits.dtype).min
+
+        def direction_loss(direction_logits: Tensor, mask: Tensor) -> Tensor:
+            positive_logits = direction_logits.masked_fill(~mask, negative_infinity)
+            return -(
+                torch.logsumexp(positive_logits, dim=1)
+                - torch.logsumexp(direction_logits, dim=1)
+            ).mean()
+
+        return 0.5 * (
+            direction_loss(logits, positive_mask)
+            + direction_loss(logits.transpose(0, 1), positive_mask.transpose(0, 1))
+        )
 
     @staticmethod
     def weighted_ntp_loss(

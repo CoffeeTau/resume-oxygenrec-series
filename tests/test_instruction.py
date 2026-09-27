@@ -56,6 +56,59 @@ class InstructionQ2IIGRTest(unittest.TestCase):
         output.loss.backward()
         self.assertIsNotNone(self.model.query_adapter[0].weight.grad)
 
+    def test_q2i_auxiliary_loss_does_not_move_shared_sid_embeddings(self):
+        from oxygenrec.model import OxygenRECConfig, OxygenRECModel
+
+        model = OxygenRECModel(OxygenRECConfig(
+            sid_width=16, hidden_size=16, attention_heads=4,
+            encoder_layers=1, decoder_layers=1, feedforward_size=32,
+            dropout=0.0, max_history_items=3, scenario_vocab_size=2,
+            instruction_feature_size=6, q2i_dimension=8, q2i_weight=0.2,
+        ))
+        output = model(
+            self.short, self.short_mask, target_sids=self.targets,
+            scenario_ids=torch.tensor([0, 1]), instruction_features=self.features,
+        )
+        output.q2i_loss.backward()
+        self.assertIsNone(model.sid_embeddings[0].weight.grad)
+        self.assertIsNotNone(model.item_adapter[0].weight.grad)
+
+    def test_v11_query_is_coupled_to_decoder_and_uses_contrastive_loss(self):
+        from oxygenrec.model import OxygenRECConfig, OxygenRECModel
+
+        torch.manual_seed(23)
+        model = OxygenRECModel(OxygenRECConfig(
+            sid_width=16, hidden_size=16, attention_heads=4,
+            encoder_layers=1, decoder_layers=1, feedforward_size=32,
+            dropout=0.0, max_history_items=3, scenario_vocab_size=2,
+            instruction_feature_size=6, q2i_dimension=8, q2i_weight=0.05,
+            q2i_decoder_weight=0.25, q2i_contrastive_weight=1.0,
+            q2i_temperature=0.1,
+        ))
+        output = model(
+            self.short, self.short_mask, target_sids=self.targets,
+            scenario_ids=torch.tensor([0, 1]), instruction_features=self.features,
+        )
+        self.assertIsNotNone(output.q2i_contrastive_loss)
+        self.assertTrue(torch.isfinite(output.q2i_contrastive_loss))
+        output.loss.backward()
+        self.assertIsNotNone(model.query_to_decoder.weight.grad)
+
+    def test_recency_weight_one_selects_most_recent_valid_long_items(self):
+        from oxygenrec.model import OxygenRECConfig, OxygenRECModel
+
+        model = OxygenRECModel(OxygenRECConfig(
+            sid_width=16, hidden_size=16, attention_heads=4,
+            encoder_layers=1, decoder_layers=1, feedforward_size=32,
+            dropout=0.0, max_history_items=3, q2i_dimension=8,
+            igr_top_k=2, igr_recency_weight=1.0,
+        ))
+        query = torch.nn.functional.normalize(torch.randn(2, 8), dim=-1)
+        _, _, indices, _ = model._augment_history(
+            self.short, self.short_mask, self.long, self.long_mask, query,
+        )
+        self.assertEqual(indices.tolist(), [[2, 1], [2, 1]])
+
     def test_dense_instruction_changes_predictions(self):
         self.model.eval()
         zeros = torch.zeros_like(self.features)

@@ -248,6 +248,56 @@ RUN_MODE=confirm CONFIRM_VARIANT=qwen_q2i ./run_v1_fast_slow_experiments.sh
 
 不要根据 test 结果换候选或调参；否则 test 也变成 validation，最终增益不再可信。
 
+## 6.3 首轮 screen 无增益时：运行 V1.1 定向修正
+
+首轮实测出现了两个明确问题：Q2I cosine 上升但推荐列表不变；纯语义 IGR
+的 exact-item recall 低于 recent/random。V1.1 只针对这两个问题修改，不重新生成
+昂贵的 Qwen 缓存：
+
+- Q2I query 以残差形式进入 Decoder prompt，使辅助表征进入主排序链路；
+- 加入 batch 内多正样本对比损失，重复 target 不会被误当成负样本；
+- Q2I target 侧停止更新共享 SID embedding，降低辅助损失破坏 NTP 的风险；
+- IGR 使用 `0.5 × semantic + 0.5 × recency`，并把检索量从 10 降到 5；
+- cohort 仍固定为至少 10 条长历史，因此与首轮 Qwen cache 完全一致。
+
+服务器拉取新代码后直接运行：
+
+```bash
+RUN_MODE=refine ./run_v1_fast_slow_experiments.sh
+```
+
+它默认复用：
+
+```text
+artifacts/v1_fast_slow_mainline/pretrain/seed-17/base/best.pt
+artifacts/v1_fast_slow_mainline/cache/qwen_instruction_features.pt
+artifacts/v1_fast_slow_mainline/cache/qwen_instruction_reasoning.jsonl
+```
+
+新结果单独写到：
+
+```text
+artifacts/v1_fast_slow_v11/
+```
+
+因此不会覆盖或跳过首轮结果，也不需要再次加载 Qwen3-4B。最后的终端汇总会直接显示
+`best_epochs`、`q2i`、`exact_igr`、`recent`、`delta_recent` 和 `random`，只需截图
+这几行即可分析。若输出被终端滚走，可执行：
+
+```bash
+RUN_MODE=refine_summary ./run_v1_fast_slow_experiments.sh
+```
+
+只有候选 HR@5 为正、MRR/NDCG 不同时恶化时才进入确认。例如 V1.1 的 C 胜出：
+
+```bash
+RUN_MODE=refine_confirm CONFIRM_VARIANT=qwen_q2i \
+  ./run_v1_fast_slow_experiments.sh
+```
+
+若 D 胜出，则把候选改成 `igr_qwen_q2i`。此外，D 的
+`delta_recent` 应大于 0；否则即使 HR@5 偶然提高，也不能声称 IGR 检索机制优于简单时序基线。
+
 # 7. 结果在哪里
 
 默认根目录：

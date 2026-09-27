@@ -139,7 +139,7 @@ def summarize(grouped: dict[str, list[dict]], *, split: str) -> dict:
         for key in (
             "q2i_cosine", "q2i_alignment_loss", "exact_repeat_recall",
             "exact_repeat_recent_recall", "exact_repeat_random_expected_recall",
-            "exact_repeat_lift_over_random", "repeat_recall",
+            "exact_repeat_lift_over_random", "exact_repeat_eligible", "repeat_recall",
         ):
             values = [float(row[key]) for row in retrieval_rows if row.get(key) is not None]
             optional[key] = _mean_std(values) if values else None
@@ -187,6 +187,7 @@ def write_outputs(summary: dict, output_dir: Path) -> None:
         rows.append({
             "variant": variant,
             "seeds": ",".join(str(seed) for seed in row["seeds"]),
+            "best_epochs": ",".join(str(epoch) for epoch in row["best_epochs"]),
             "hr5_mean": metrics["hr5"]["mean"],
             "hr5_std": metrics["hr5"]["std"],
             "hr5_relative_gain_vs_base": row["hr5_relative_gain_vs_base"],
@@ -207,6 +208,20 @@ def write_outputs(summary: dict, output_dir: Path) -> None:
                 retrieval["exact_repeat_recent_recall"]["mean"]
                 if retrieval["exact_repeat_recent_recall"] else None
             ),
+            "exact_repeat_random_expected_recall": (
+                retrieval["exact_repeat_random_expected_recall"]["mean"]
+                if retrieval["exact_repeat_random_expected_recall"] else None
+            ),
+            "exact_repeat_delta_vs_recent": (
+                retrieval["exact_repeat_recall"]["mean"]
+                - retrieval["exact_repeat_recent_recall"]["mean"]
+                if retrieval["exact_repeat_recall"]
+                and retrieval["exact_repeat_recent_recall"] else None
+            ),
+            "exact_repeat_eligible": (
+                retrieval["exact_repeat_eligible"]["mean"]
+                if retrieval["exact_repeat_eligible"] else None
+            ),
             "positive_hr5_seed_count": row["positive_hr5_seed_count"],
             "paired_seed_count": len(row["paired"]),
         })
@@ -221,23 +236,24 @@ def write_outputs(summary: dict, output_dir: Path) -> None:
     lines = [
         f"# V1 Fast-Slow {summary['split']} 汇总",
         "",
-        "| Variant | Seeds | HR@5 | 相对Base | MRR | NDCG | Legal SID | Q2I cosine | Exact IGR Recall |",
-        "|---|---|---:|---:|---:|---:|---:|---:|---:|",
+        "| Variant | Seeds | Best epoch | HR@5 | 相对Base | MRR | NDCG | Q2I cosine | Exact IGR | Recent | Δ vs Recent |",
+        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in rows:
         relative = row["hr5_relative_gain_vs_base"]
         lines.append(
-            f"| {row['variant']} | {row['seeds']} | "
+            f"| {row['variant']} | {row['seeds']} | {row['best_epochs']} | "
             f"{row['hr5_mean']:.6f}±{row['hr5_std']:.6f} | "
             f"{relative * 100:+.2f}% | " if relative is not None else
-            f"| {row['variant']} | {row['seeds']} | "
+            f"| {row['variant']} | {row['seeds']} | {row['best_epochs']} | "
             f"{row['hr5_mean']:.6f}±{row['hr5_std']:.6f} | n/a | "
         )
         lines[-1] += (
             f"{row['mrr_mean']:.6f} | {row['ndcg_mean']:.6f} | "
-            f"{row['legal_sid_rate']:.6f} | "
             f"{row['q2i_cosine'] if row['q2i_cosine'] is not None else 'n/a'} | "
-            f"{row['exact_repeat_recall'] if row['exact_repeat_recall'] is not None else 'n/a'} |"
+            f"{row['exact_repeat_recall'] if row['exact_repeat_recall'] is not None else 'n/a'} | "
+            f"{row['exact_repeat_recent_recall'] if row['exact_repeat_recent_recall'] is not None else 'n/a'} | "
+            f"{row['exact_repeat_delta_vs_recent'] if row['exact_repeat_delta_vs_recent'] is not None else 'n/a'} |"
         )
     lines.extend([
         "",
@@ -262,11 +278,27 @@ def main() -> int:
         metrics = row["metrics"]
         relative = row["hr5_relative_gain_vs_base"]
         relative_text = "n/a" if relative is None else f"{relative * 100:+.2f}%"
+        retrieval = row["retrieval"]
+        def optional_mean(name: str) -> str:
+            value = retrieval.get(name)
+            return "n/a" if value is None else f"{value['mean']:.6f}"
+        exact = retrieval.get("exact_repeat_recall")
+        recent = retrieval.get("exact_repeat_recent_recall")
+        delta_recent = (
+            "n/a" if exact is None or recent is None
+            else f"{exact['mean'] - recent['mean']:+.6f}"
+        )
         print(
             f"variant={variant} seeds={row['seeds']} "
+            f"best_epochs={row['best_epochs']} "
             f"hr5={metrics['hr5']['mean']:.6f}+/-{metrics['hr5']['std']:.6f} "
             f"gain_vs_base={relative_text} mrr={metrics['mrr']['mean']:.6f} "
             f"ndcg={metrics['ndcg']['mean']:.6f} "
+            f"q2i={optional_mean('q2i_cosine')} "
+            f"exact_igr={optional_mean('exact_repeat_recall')} "
+            f"recent={optional_mean('exact_repeat_recent_recall')} "
+            f"delta_recent={delta_recent} "
+            f"random={optional_mean('exact_repeat_random_expected_recall')} "
             f"positive_seeds={row['positive_hr5_seed_count']}/{len(row['paired'])}"
         )
     print(f"SUMMARY_JSON={output_dir / 'summary.json'}")

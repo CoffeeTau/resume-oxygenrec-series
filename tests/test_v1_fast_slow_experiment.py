@@ -100,6 +100,7 @@ class FastSlowSummaryTest(unittest.TestCase):
     @staticmethod
     def _record(variant, seed, hr5):
         return {
+            "_path": f"seed-{seed}/{variant}/result.json",
             "variant": variant,
             "seed": seed,
             "epoch": 2,
@@ -119,6 +120,9 @@ class FastSlowSummaryTest(unittest.TestCase):
             "retrieval": {
                 "q2i_cosine": 0.2 if "q2i" in variant else None,
                 "exact_repeat_recall": 0.4 if variant.startswith("igr") else None,
+                "exact_repeat_recent_recall": 0.3 if variant.startswith("igr") else None,
+                "exact_repeat_random_expected_recall": 0.2 if variant.startswith("igr") else None,
+                "exact_repeat_eligible": 10 if variant.startswith("igr") else 0,
             },
         }
 
@@ -140,6 +144,16 @@ class FastSlowSummaryTest(unittest.TestCase):
             self.assertTrue((root / "summary.json").is_file())
             self.assertTrue((root / "summary.csv").is_file())
             self.assertIn("qwen_instruction", (root / "summary.md").read_text())
+
+    def test_summary_exposes_igr_delta_against_recency(self):
+        grouped = {
+            "base": [self._record("base", 17, 0.10)],
+            "igr_qwen_q2i": [self._record("igr_qwen_q2i", 17, 0.11)],
+        }
+        summary = summarize(grouped, split="validation")
+        retrieval = summary["variants"]["igr_qwen_q2i"]["retrieval"]
+        self.assertAlmostEqual(retrieval["exact_repeat_recall"]["mean"], 0.4)
+        self.assertAlmostEqual(retrieval["exact_repeat_recent_recall"]["mean"], 0.3)
 
     def test_rejects_mixed_sample_cohorts(self):
         grouped = {
@@ -167,6 +181,8 @@ class CommonBaseWarmStartTest(unittest.TestCase):
             sid_width=8, hidden_size=8, attention_heads=2,
             encoder_layers=1, decoder_layers=1, feedforward_size=16,
             max_history_items=4, igr_top_k=2, dropout=0.0,
+            q2i_weight=0.05, q2i_decoder_weight=0.25,
+            q2i_contrastive_weight=1.0,
         ))
         with tempfile.TemporaryDirectory() as directory:
             checkpoint = Path(directory) / "base.pt"
@@ -185,6 +201,7 @@ class CommonBaseWarmStartTest(unittest.TestCase):
             )
         self.assertEqual(report["source_epoch"], 3)
         self.assertEqual(report["partial_tensors"][0]["name"], "history_positions.weight")
+        self.assertIsNotNone(target.query_to_decoder)
         torch.testing.assert_close(
             target.history_positions.weight[:4], source.history_positions.weight,
         )
